@@ -44,6 +44,7 @@ nomenclature_re = re.compile(
     r"\b\d+(?:[ _-]+\d+)+[ _-]+[CP](?=[\s_-]|$)",
     re.IGNORECASE
 )
+
 def _name_matches_nomenclature(pdf_id: str, data: dict = None) -> bool:
     filename = None
     if isinstance(data, dict):
@@ -100,6 +101,53 @@ def _pick_latest_version_pdf(folder: Path, base_id: str) -> Optional[Path]:
         return None
 
     return best
+
+# =========================
+# Helpers TXT canónico (SOLO este formato)
+#   Ej: 5497_42-10-01-003_C.txt
+# =========================
+
+TXT_CANONICAL_RE = re.compile(r"^\d+_\d{1,2}-\d{1,2}-\d{1,3}-\d{1,3}_[CP]$", re.IGNORECASE)
+
+def _base_id_to_txt_id(base_id: str) -> Optional[str]:
+    """
+    Convierte base_id (underscores) a txt_id (con guiones):
+      5497_42_10_01_003_C  ->  5497_42-10-01-003_C
+    """
+    if not base_id:
+        return None
+
+    parts = base_id.split("_")
+    # esperado: A, B, C, D, E, L
+    if len(parts) != 6:
+        return None
+
+    a, b, c, d, e, letter = parts
+    txt_id = f"{a}_{b}-{c}-{d}-{e}_{letter}"
+
+    return txt_id if TXT_CANONICAL_RE.match(txt_id) else None
+
+def _find_canonical_txt(extracted_dir: Path, base_id: str) -> Optional[Path]:
+    """
+    SOLO acepta el TXT canónico:
+      {A}_{B}-{C}-{D}-{E}_{L}.txt   (o .txt.gz)
+    """
+    if not extracted_dir or not extracted_dir.exists():
+        return None
+
+    txt_id = _base_id_to_txt_id(base_id)
+    if not txt_id:
+        return None
+
+    p_txt = extracted_dir / f"{txt_id}.txt"
+    if p_txt.exists() and p_txt.is_file():
+        return p_txt
+
+    p_gz = extracted_dir / f"{txt_id}.txt.gz"
+    if p_gz.exists() and p_gz.is_file():
+        return p_gz
+
+    return None
 
 # =========================
 # Helpers de archivos / estado
@@ -170,6 +218,7 @@ def load_existing_pdfs() -> None:
                     "task_id": None,
                 }
 
+                # flujo normal: aquí pdf_id ya trae guiones+hash, por eso sí aplica {pdf_id}.txt
                 txt_path = extracted_dir / f"{pdf_id}.txt"
                 txt_gz_path = extracted_dir / f"{pdf_id}.txt.gz"
                 out_pdf = outputs_dir / f"{pdf_id}.pdf"
@@ -208,25 +257,25 @@ def load_existing_pdfs() -> None:
                 logger.exception(f"Error cargando PDF {pdf_file}: {e}")
 
 def _infer_status_for_base(base_id: str, extracted_dir: Path, outputs_dir: Path) -> dict:
-    txt_path = extracted_dir / f"{base_id}.txt"
-    txt_gz_path = extracted_dir / f"{base_id}.txt.gz"
-    out_pdf = outputs_dir / f"{base_id}.pdf"
+    """
+    Versionados: base_id (underscores) NO debe buscar {base_id}.txt.
+    Solo se acepta TXT canónico con guiones:
+      {A}_{B}-{C}-{D}-{E}_{L}.txt
+    """
+    actual_txt = _find_canonical_txt(extracted_dir, base_id)
 
-    actual_txt = None
-    if txt_path.exists():
-        actual_txt = txt_path
-    elif txt_gz_path.exists():
-        actual_txt = txt_gz_path
+    out_pdf = outputs_dir / f"{base_id}.pdf" if outputs_dir else None
+    has_out_pdf = bool(out_pdf and out_pdf.exists())
 
-    if actual_txt or out_pdf.exists():
+    if actual_txt or has_out_pdf:
         completed_src = actual_txt if actual_txt else out_pdf
         return {
             "status": "completed",
             "created_at": None,
             "completed_at": datetime.fromtimestamp(float(completed_src.stat().st_mtime)),
-            "used_ocr": bool(out_pdf.exists()),
+            "used_ocr": has_out_pdf,
             "extracted_text_path": str(actual_txt) if actual_txt else None,
-            "ocr_pdf_path": str(out_pdf) if out_pdf.exists() else None,
+            "ocr_pdf_path": str(out_pdf) if has_out_pdf else None,
             "task_id": None,
             "mode": "local",
             "pages": None,
@@ -276,9 +325,8 @@ def _scan_docs_root_latest_versions(docs_root: Path) -> dict:
 
 def _get_docs_root_safe() -> Optional[Path]:
     """
-    Tu Settings pegado no trae DOCS_ROOT, pero tu router lo usa.
-    Si sí lo tienes en tu proyecto real, esto lo toma.
-    Si no existe, regresamos None y desactivamos versionado.
+    Si DOCS_ROOT existe en settings, se usa.
+    Si no, regresa None.
     """
     docs_root_val = getattr(settings, "DOCS_ROOT", None)
     if not docs_root_val:
@@ -398,6 +446,8 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
             try:
                 pdf_task_status[pid].update({"status": "processing", "progress": 50})
                 text, pages, used_ocr_ = pdf_service.extract_text_from_pdf(ppath, use_ocr=puse_ocr)
+
+                # Flujo normal: pid trae hash, el txt de este flujo sigue guardándose con pid
                 text_path = pdf_service.save_extracted_text(text, pid)
 
                 pdf_task_status[pid].update({
@@ -540,19 +590,27 @@ async def search_pdf(pdf_id: str, search_request: SearchRequest):
 
     # Prioridad: status -> storage -> inferred
     text_path = ts.get("extracted_text_path") or meta.get("text_path")
+
     if not text_path or not os.path.exists(str(text_path)):
-        candidate_txt = extracted_dir / f"{pdf_id}.txt"
-        candidate_gz = extracted_dir / f"{pdf_id}.txt.gz"
-        if candidate_txt.exists():
-            text_path = str(candidate_txt)
-        elif candidate_gz.exists():
-            text_path = str(candidate_gz)
+        # Si es base_id (versionado), busca SOLO TXT canónico
+        if _is_base_id(pdf_id):
+            found = _find_canonical_txt(extracted_dir, pdf_id)
+            text_path = str(found) if found else None
+        else:
+            # flujo normal: pdf_id ya trae formato con guiones/hash
+            candidate_txt = extracted_dir / f"{pdf_id}.txt"
+            candidate_gz = extracted_dir / f"{pdf_id}.txt.gz"
+            if candidate_txt.exists():
+                text_path = str(candidate_txt)
+            elif candidate_gz.exists():
+                text_path = str(candidate_gz)
+            else:
+                text_path = None
 
     text = _load_text_from_file(str(text_path)) if text_path else ""
     if not text:
         raise HTTPException(status_code=404, detail="Texto no encontrado para este PDF")
 
-    # Tu SearchRequest trae use_regex pero tu PDFService decide si lo soporta o no.
     results = pdf_service.search_in_text(
         text,
         search_request.term,
@@ -647,12 +705,18 @@ async def get_pdf_text(pdf_id: str):
     text_path = task_status.get("extracted_text_path") or pdf_data.get("text_path")
 
     if not text_path or not os.path.exists(str(text_path)):
-        candidate_txt = extracted_dir / f"{pdf_id}.txt"
-        candidate_gz = extracted_dir / f"{pdf_id}.txt.gz"
-        if candidate_txt.exists():
-            text_path = str(candidate_txt)
-        elif candidate_gz.exists():
-            text_path = str(candidate_gz)
+        if _is_base_id(pdf_id):
+            found = _find_canonical_txt(extracted_dir, pdf_id)
+            text_path = str(found) if found else None
+        else:
+            candidate_txt = extracted_dir / f"{pdf_id}.txt"
+            candidate_gz = extracted_dir / f"{pdf_id}.txt.gz"
+            if candidate_txt.exists():
+                text_path = str(candidate_txt)
+            elif candidate_gz.exists():
+                text_path = str(candidate_gz)
+            else:
+                text_path = None
 
     if text_path and os.path.exists(str(text_path)):
         return FileResponse(str(text_path), media_type="text/plain", filename=f"{pdf_id}_texto.txt")
@@ -662,10 +726,9 @@ async def get_pdf_text(pdf_id: str):
 @router.get("/{pdf_id}/searchable-pdf")
 async def get_searchable_pdf(pdf_id: str):
     outputs_dir = Path(settings.OUTPUTS_FOLDER)
-
     docs_root = _get_docs_root_safe()
 
-    # Caso A: base_id (versionado)
+    # Caso A: base_id (versionado) -> devuelve PDF latest en DOCS_ROOT
     if _is_base_id(pdf_id):
         if not docs_root:
             raise HTTPException(status_code=400, detail="DOCS_ROOT no está configurado en settings")
@@ -854,25 +917,19 @@ async def list_pdfs():
     """
     LISTA SOLO DESDE DOCS_ROOT (versionados).
     Devuelve 1 entrada por carpeta base_id (la versión más alta: vN, luego ts, luego mtime).
-
-    - created_at/completed_at: datetime o None
-    - upload_time: float (mtime del pdf latest)
     """
     extracted_dir = Path(settings.EXTRACTED_FOLDER)
     outputs_dir = Path(settings.OUTPUTS_FOLDER)
 
     pdfs_list: list[Dict[str, Any]] = []
 
-    # 1) SOLO Versionados desde DOCS_ROOT
     docs_root = _get_docs_root_safe()
     if not docs_root:
-        # si quieres, puedes cambiar esto por regresar lista vacía en vez de error
         raise HTTPException(status_code=400, detail="DOCS_ROOT no está configurado en settings")
 
     latest_map = _scan_docs_root_latest_versions(docs_root)
 
     for base_id, info in latest_map.items():
-        # filtro por nomenclatura (mismo criterio que ya usas)
         if not _name_matches_nomenclature(base_id, {"filename": base_id}):
             continue
 
@@ -894,7 +951,8 @@ async def list_pdfs():
             "filename": f"{base_id}.pdf",
             "size_bytes": size_bytes,
             "size_mb": size_mb,
-            "status": status if status in ("completed", "processing", "pending", "failed") else "pending",
+            # IMPORTANTe: NO forzar unknown->pending, para que veas problemas reales
+            "status": status if status in ("completed", "processing", "pending", "failed") else "unknown",
             "progress": progress,
             "pages": ts.get("pages"),
             "task_id": ts.get("task_id") or "",
@@ -917,7 +975,6 @@ async def list_pdfs():
                 "task_id": None,
             }
 
-    # Ordenar por upload_time desc
     pdfs_list.sort(key=lambda x: x.get("upload_time", 0), reverse=True)
 
     by_status_lists = {
@@ -925,6 +982,7 @@ async def list_pdfs():
         "processing": [p for p in pdfs_list if p["status"] == "processing"],
         "pending": [p for p in pdfs_list if p["status"] == "pending"],
         "failed": [p for p in pdfs_list if p["status"] == "failed"],
+        "unknown": [p for p in pdfs_list if p["status"] == "unknown"],
     }
 
     return {
@@ -936,7 +994,12 @@ async def list_pdfs():
             "failed": len(by_status_lists["failed"]),
         },
         "pdfs": pdfs_list,
-        "summary": by_status_lists,
+        "summary": {
+            "completed": by_status_lists["completed"],
+            "processing": by_status_lists["processing"],
+            "pending": by_status_lists["pending"],
+            "failed": by_status_lists["failed"],
+        },
     }
 
 @router.get("/dashboard")
@@ -1087,7 +1150,6 @@ async def global_search(
     start_time = time.time()
     extracted_dir = Path(settings.EXTRACTED_FOLDER)
 
-    # asegurar versionados en storage si existe DOCS_ROOT
     _ensure_docs_root_in_storage()
 
     valid_entries = [
@@ -1102,15 +1164,20 @@ async def global_search(
         ts = pdf_task_status.get(pdf_id, {})
 
         text_path = ts.get("extracted_text_path") or meta.get("text_path")
+
         if not text_path or not os.path.exists(str(text_path)):
-            txt_candidate = extracted_dir / f"{pdf_id}.txt"
-            gz_candidate = extracted_dir / f"{pdf_id}.txt.gz"
-            if txt_candidate.exists():
-                text_path = str(txt_candidate)
-            elif gz_candidate.exists():
-                text_path = str(gz_candidate)
+            if _is_base_id(pdf_id):
+                found = _find_canonical_txt(extracted_dir, pdf_id)
+                text_path = str(found) if found else None
             else:
-                text_path = None
+                txt_candidate = extracted_dir / f"{pdf_id}.txt"
+                gz_candidate = extracted_dir / f"{pdf_id}.txt.gz"
+                if txt_candidate.exists():
+                    text_path = str(txt_candidate)
+                elif gz_candidate.exists():
+                    text_path = str(gz_candidate)
+                else:
+                    text_path = None
 
         text = _load_text_from_file(text_path) if text_path else ""
         if not text:
