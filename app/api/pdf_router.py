@@ -963,7 +963,7 @@ async def list_pdfs():
             "used_ocr": bool(ts.get("used_ocr", False)),
             "error": ts.get("error"),
         })
-
+    
         # sync en storage (opcional, sirve para global-search)
         if base_id not in pdf_storage:
             pdf_storage[base_id] = {
@@ -975,6 +975,43 @@ async def list_pdfs():
                 "task_id": None,
             }
 
+    # === AÑADIR PDFs SUBIDOS (No versionados en DOCS_ROOT) ===
+    # Estos PDFs están en pdf_storage pero no en latest_map
+    for pdf_id, meta in pdf_storage.items():
+        if pdf_id in latest_map:
+            continue  # Ya procesado arriba
+        
+        # Ocultar temporales de quick-search
+        if pdf_id.startswith("temp_"):
+            continue
+
+        ts = pdf_task_status.get(pdf_id, {})
+        status = ts.get("status") or meta.get("status") or "unknown"
+        progress = 100 if status == "completed" else 50 if status == "processing" else 0
+        
+        size_bytes = int(meta.get("size", 0))
+        size_mb = round(size_bytes / (1024 * 1024), 2)
+        
+        created_at = ts.get("created_at")
+        completed_at = ts.get("completed_at")
+        
+        pdfs_list.append({
+            "id": pdf_id,
+            "filename": meta.get("filename", f"{pdf_id}.pdf"),
+            "size_bytes": size_bytes,
+            "size_mb": size_mb,
+            "status": status if status in ("completed", "processing", "pending", "failed") else "unknown",
+            "progress": progress,
+            "pages": ts.get("pages") or meta.get("pages"),
+            "task_id": ts.get("task_id") or meta.get("task_id") or "",
+            "upload_time": float(meta.get("upload_time", 0)),
+            "created_at": created_at if isinstance(created_at, datetime) else None,
+            "completed_at": completed_at if isinstance(completed_at, datetime) else None,
+            "extracted_text_path": ts.get("extracted_text_path") or meta.get("text_path"),
+            "used_ocr": bool(ts.get("used_ocr") or meta.get("use_ocr", False)),
+            "error": ts.get("error") or meta.get("error"),
+        })
+
     pdfs_list.sort(key=lambda x: x.get("upload_time", 0), reverse=True)
 
     by_status_lists = {
@@ -983,23 +1020,23 @@ async def list_pdfs():
         "pending": [p for p in pdfs_list if p["status"] == "pending"],
         "failed": [p for p in pdfs_list if p["status"] == "failed"],
         "unknown": [p for p in pdfs_list if p["status"] == "unknown"],
+        "with_ocr": [p for p in pdfs_list if p.get("used_ocr", False)]
+    }
+
+    by_status_counts = {
+        "completed": len(by_status_lists["completed"]),
+        "processing": len(by_status_lists["processing"]),
+        "pending": len(by_status_lists["pending"]),
+        "failed": len(by_status_lists["failed"]),
+        "unknown": len(by_status_lists["unknown"]),
+        "with_ocr": len(by_status_lists["with_ocr"])
     }
 
     return {
         "total": len(pdfs_list),
-        "by_status": {
-            "completed": len(by_status_lists["completed"]),
-            "processing": len(by_status_lists["processing"]),
-            "pending": len(by_status_lists["pending"]),
-            "failed": len(by_status_lists["failed"]),
-        },
+        "by_status": by_status_counts,
         "pdfs": pdfs_list,
-        "summary": {
-            "completed": by_status_lists["completed"],
-            "processing": by_status_lists["processing"],
-            "pending": by_status_lists["pending"],
-            "failed": by_status_lists["failed"],
-        },
+        "summary": by_status_lists
     }
 
 @router.get("/dashboard")
