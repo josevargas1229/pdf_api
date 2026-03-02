@@ -1054,12 +1054,22 @@ async def list_pdfs():
                 "task_id": None,
             }
 
+    processed_base_ids = {str(k).upper() for k in latest_map.keys()}
+
     # === AÑADIR PDFs SUBIDOS (No versionados en DOCS_ROOT) ===
     # Estos PDFs están en pdf_storage pero no en latest_map
     for pdf_id, meta in pdf_storage.items():
         if pdf_id in latest_map:
             continue  # Ya procesado arriba
-        
+
+        # Evitar duplicados si el pdf_id original corresponde a un archivo que ya leímos de DOCS_ROOT
+        original_filename = meta.get("filename", "")
+        if original_filename:
+            norm_name = re.sub(r'[^\w]', '_', Path(original_filename).stem)
+            norm_name = re.sub(r'_+', '_', norm_name).strip('_').upper()
+            if norm_name in processed_base_ids:
+                continue
+
         # Ocultar temporales de quick-search
         if pdf_id.startswith("temp_"):
             continue
