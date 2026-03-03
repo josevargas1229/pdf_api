@@ -400,7 +400,7 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
         if has_workers:
             task = process_pdf_task.delay(pdf_id=pdf_id, pdf_path=pdf_path, use_ocr=use_ocr)
 
-            pdf_storage[pdf_id].update({"task_id": task.id, "mode": "celery"})
+            pdf_storage.update_key(pdf_id, {"task_id": task.id, "mode": "celery"})
             pdf_task_status[pdf_id] = {
                 "task_id": task.id,
                 "status": "pending",
@@ -427,7 +427,7 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
             )
 
         # Local
-        pdf_storage[pdf_id].update({"task_id": None, "mode": "local"})
+        pdf_storage.update_key(pdf_id, {"task_id": None, "mode": "local"})
         pdf_task_status[pdf_id] = {
             "task_id": None,
             "status": "pending",
@@ -444,13 +444,13 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
 
         def _local_process(pid: str, ppath: str, puse_ocr: bool):
             try:
-                pdf_task_status[pid].update({"status": "processing", "progress": 50})
+                pdf_task_status.update_key(pid, {"status": "processing", "progress": 50})
                 text, pages, used_ocr_ = pdf_service.extract_text_from_pdf(ppath, use_ocr=puse_ocr)
 
                 # Flujo normal: pid trae hash, el txt de este flujo sigue guardándose con pid
                 text_path = pdf_service.save_extracted_text(text, pid)
 
-                pdf_task_status[pid].update({
+                pdf_task_status.update_key(pid, {
                     "status": "completed",
                     "pages": pages,
                     "extracted_text_path": text_path,
@@ -461,13 +461,13 @@ async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
                 })
 
                 # NO guardar texto completo
-                pdf_storage[pid].update({
+                pdf_storage.update_key(pid, {
                     "pages": pages,
                     "text_path": text_path,
                 })
             except Exception as e:
                 logger.exception(f"Error en procesamiento local {pid}: {e}")
-                pdf_task_status[pid].update({
+                pdf_task_status.update_key(pid, {
                     "status": "failed",
                     "error": str(e),
                     "completed_at": datetime.now(),
@@ -532,7 +532,7 @@ async def get_upload_status(pdf_id: str):
 
     if task.state == "SUCCESS" and isinstance(task.result, dict):
         result = task.result
-        pdf_task_status[pdf_id].update({
+        pdf_task_status.update_key(pdf_id, {
             "status": "completed",
             "pages": result.get("pages"),
             "extracted_text_path": result.get("text_path"),
@@ -544,7 +544,7 @@ async def get_upload_status(pdf_id: str):
             "mode": "celery",
             "progress": 100,
         })
-        pdf_storage.get(pdf_id, {}).update({
+        pdf_storage.update_key(pdf_id, {
             "pages": result.get("pages"),
             "text_path": result.get("text_path"),
             "completed": True,
@@ -552,7 +552,7 @@ async def get_upload_status(pdf_id: str):
 
     elif task.state == "FAILURE":
         err = str(task.info) if task.info else "Error desconocido"
-        pdf_task_status[pdf_id].update({
+        pdf_task_status.update_key(pdf_id, {
             "status": "failed",
             "error": err,
             "completed_at": datetime.now(),
@@ -977,7 +977,7 @@ async def list_pdfs():
                     res = task.result
                     # Solo actualizar si antes NO era completed
                     if ts_dict.get("status") != "completed":
-                        ts_dict.update({
+                        updates = {
                             "status": "completed",
                             "pages": res.get("pages"),
                             "extracted_text_path": res.get("text_path"),
@@ -987,21 +987,26 @@ async def list_pdfs():
                             "completed_at": datetime.now(),
                             "error": None,
                             "progress": 100,
-                        })
+                        }
+                        ts_dict.update(updates)
+                        pdf_task_status.update_key(p_id, updates)
+
                         if p_id in pdf_storage:
-                            pdf_storage[p_id].update({
+                            pdf_storage.update_key(p_id, {
                                 "pages": res.get("pages"),
                                 "text_path": res.get("text_path"),
                                 "completed": True,
                             })
                 elif task.state == "FAILURE":
                     if ts_dict.get("status") != "failed":
-                        ts_dict.update({
+                        updates = {
                             "status": "failed",
                             "error": str(task.info) if task.info else "Error desconocido",
                             "completed_at": datetime.now(),
                             "progress": 0,
-                        })
+                        }
+                        ts_dict.update(updates)
+                        pdf_task_status.update_key(p_id, updates)
             except Exception:
                 pass
 
