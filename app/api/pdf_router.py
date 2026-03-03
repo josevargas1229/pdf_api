@@ -1010,42 +1010,75 @@ async def list_pdfs():
             except Exception:
                 pass
 
+    # === CREAR MAPA INVERSO PARA IDs ACTIVOS ===
+    active_uploads = {}
+    for pdf_id, meta in pdf_storage.items():
+        original_filename = meta.get("filename", "")
+        if original_filename:
+            norm_name = re.sub(r'[^\w]', '_', Path(original_filename).stem)
+            norm_name = re.sub(r'_+', '_', norm_name).strip('_').upper()
+            active_uploads[norm_name] = pdf_id
 
     for base_id, info in latest_map.items():
         if not _name_matches_nomenclature(base_id, {"filename": base_id}):
             continue
 
-        ts = pdf_task_status.get(base_id)
-        if not ts:
-            ts = _infer_status_for_base(base_id, extracted_dir, outputs_dir)
+        active_pdf_id = active_uploads.get(base_id.upper())
+        if active_pdf_id:
+            # USAR EL ESTADO DEL UPLOAD ACTIVO EN VEZ DEL HISTORICO
+            ts = pdf_task_status.get(active_pdf_id, {})
+            meta = pdf_storage.get(active_pdf_id, {})
+            _refresh_celery_status(active_pdf_id, ts, meta)
             
-        _refresh_celery_status(base_id, ts)
+            status = ts.get("status") or meta.get("status") or "unknown"
+            progress = int(ts.get("progress") or (100 if status == "completed" else 50 if status == "processing" else 0))
+            task_id_active = ts.get("task_id") or meta.get("task_id") or ""
+            pages = ts.get("pages") or meta.get("pages")
+            
+            created_at = ts.get("created_at")
+            completed_at = ts.get("completed_at")
+            extracted_text_path = ts.get("extracted_text_path") or meta.get("text_path")
+            used_ocr = bool(ts.get("used_ocr") or meta.get("use_ocr", False))
+            error_msg = ts.get("error") or meta.get("error")
+            upload_time_val = float(meta.get("upload_time", info["mtime"]))
+        else:
+            # FLUJO NORMAL USANDO DOCS_ROOT histórico
+            ts = pdf_task_status.get(base_id)
+            if not ts:
+                ts = _infer_status_for_base(base_id, extracted_dir, outputs_dir)
+                
+            _refresh_celery_status(base_id, ts)
 
-        status = ts.get("status", "unknown")
-        progress = int(ts.get("progress") or (100 if status == "completed" else 50 if status == "processing" else 0))
+            status = ts.get("status", "unknown")
+            progress = int(ts.get("progress") or (100 if status == "completed" else 50 if status == "processing" else 0))
+            task_id_active = ts.get("task_id") or ""
+            pages = ts.get("pages")
+            
+            created_at = ts.get("created_at")
+            completed_at = ts.get("completed_at")
+            extracted_text_path = ts.get("extracted_text_path")
+            used_ocr = bool(ts.get("used_ocr", False))
+            error_msg = ts.get("error")
+            upload_time_val = float(info["mtime"])
 
         size_bytes = int(info["size"])
         size_mb = round(size_bytes / (1024 * 1024), 2)
-
-        created_at = ts.get("created_at")
-        completed_at = ts.get("completed_at")
 
         pdfs_list.append({
             "id": base_id,
             "filename": f"{base_id}.pdf",
             "size_bytes": size_bytes,
             "size_mb": size_mb,
-            # IMPORTANTe: NO forzar unknown->pending, para que veas problemas reales
             "status": status if status in ("completed", "processing", "pending", "failed") else "unknown",
             "progress": progress,
-            "pages": ts.get("pages"),
-            "task_id": ts.get("task_id") or "",
-            "upload_time": float(info["mtime"]),
+            "pages": pages,
+            "task_id": task_id_active,
+            "upload_time": upload_time_val,
             "created_at": created_at if isinstance(created_at, datetime) else None,
             "completed_at": completed_at if isinstance(completed_at, datetime) else None,
-            "extracted_text_path": ts.get("extracted_text_path"),
-            "used_ocr": bool(ts.get("used_ocr", False)),
-            "error": ts.get("error"),
+            "extracted_text_path": extracted_text_path,
+            "used_ocr": used_ocr,
+            "error": error_msg,
         })
     
         # sync en storage (opcional, sirve para global-search)
