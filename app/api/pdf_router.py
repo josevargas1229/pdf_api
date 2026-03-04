@@ -1333,3 +1333,4 @@ async def update_final_path(pdf_id: str, request: UpdatePathRequest):
         pdf_task_status[pdf_id]["ocr_pdf_path"] = request.new_path
         
     return {"message": "Ruta actualizada exitosamente en memoria", "pdf_id": pdf_id, "new_path": request.new_path}
+
