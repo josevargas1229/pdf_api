@@ -1231,15 +1231,15 @@ async def global_search(
             'StartSel=<mark>, StopSel=</mark>, MaxFragments=2, MinWords=5, MaxWords=25'
         ) AS snippet
     FROM archivos_digitales,
-         plainto_tsquery('spanish', $1) q
+         plainto_tsquery('spanish', :term) q
     WHERE
         estado_ocr = 'completado'
         AND texto_ocr_tsv @@ q
     ORDER BY score DESC
-    LIMIT $2;
+    LIMIT :limit;
     """
 
-    rows = await db.fetch_all(sql, (term, limit))
+    rows = await db.fetch_all(sql, {"term": term, "limit": limit})
 
     return {
         "term": term,
@@ -1333,4 +1333,3 @@ async def update_final_path(pdf_id: str, request: UpdatePathRequest):
         pdf_task_status[pdf_id]["ocr_pdf_path"] = request.new_path
         
     return {"message": "Ruta actualizada exitosamente en memoria", "pdf_id": pdf_id, "new_path": request.new_path}
-
