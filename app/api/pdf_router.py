@@ -150,7 +150,37 @@ def _find_canonical_txt(extracted_dir: Path, base_id: str) -> Optional[Path]:
         return p_gz
 
     return None
+DISPLAY_VERSIONED_RE = re.compile(r"^(?P<base>.+)_v\d+_\d+$", re.IGNORECASE)
 
+def _clean_display_filename(pdf_id: str, data: dict = None) -> str:
+    """
+    Devuelve el nombre visible limpio para UI.
+    Ej:
+      5496_05_10_01_003_C_v2_17726874369.pdf  -> 5496_05_10_01_003_C.pdf
+      5496_05_10_01_003_C                     -> 5496_05_10_01_003_C.pdf
+    """
+    filename = None
+    if isinstance(data, dict):
+        filename = data.get("filename")
+
+    raw = filename or f"{pdf_id}.pdf"
+
+    try:
+        stem = Path(raw).stem
+    except Exception:
+        stem = str(raw).replace(".pdf", "")
+
+    m = DISPLAY_VERSIONED_RE.match(stem)
+    if m:
+        return f"{m.group('base')}.pdf"
+
+    if _is_base_id(stem):
+        return f"{stem}.pdf"
+
+    if _is_base_id(pdf_id):
+        return f"{pdf_id}.pdf"
+
+    return f"{stem}.pdf"
 # =========================
 # Helpers de archivos / estado
 # =========================
@@ -332,7 +362,7 @@ def _scan_docs_root_latest_versions(docs_root: Path) -> dict:
             "pdf_path": str(best_pdf),
             "mtime": float(st.st_mtime),
             "size": int(st.st_size),
-            "filename": best_pdf.name,
+            "filename": f"{base_id}.pdf",
         }
 
     return latest
@@ -1063,7 +1093,7 @@ async def list_pdfs():
         
         pdfs_list.append({
             "id": pdf_id,
-            "filename": meta.get("filename", f"{pdf_id}.pdf"),
+            "filename": _clean_display_filename(pdf_id, meta),
             "size_bytes": size_bytes,
             "size_mb": size_mb,
             "status": status if status in ("completed", "processing", "pending", "failed") else "unknown",
@@ -1368,22 +1398,7 @@ async def get_ocr_result(pdf_id: str):
         "download_text": f"/api/pdf/{pdf_id}/text",
     }
 
-def _normalize_pdf_key(value: str) -> str:
-    """
-    Normaliza IDs para poder comparar aliases del mismo PDF:
-    - cambia guiones por underscores
-    - quita extensión .pdf
-    - minúsculas
-    """
-    if not value:
-        return ""
-
-    normalized = str(value).strip().lower()
-    normalized = re.sub(r"\.pdf$", "", normalized, flags=re.IGNORECASE)
-    normalized = normalized.replace("-", "_")
-    normalized = re.sub(r"_+", "_", normalized)
-
-    return normalized
+from pydantic import BaseModel
 
 class UpdatePathRequest(BaseModel):
     new_path: str
@@ -1391,65 +1406,25 @@ class UpdatePathRequest(BaseModel):
 @router.put("/update-final-path/{pdf_id}")
 async def update_final_path(pdf_id: str, request: UpdatePathRequest):
     """
-    Actualiza la ruta final del documento en memoria.
-    Además limpia aliases viejos del mismo PDF para evitar duplicados en /list.
+    Actualiza la ruta final del documento en memoria de manera que Python 
+    no necesite reescudriñar el directorio DOCS_ROOT. (Llamado usualmente por Node.js)
     """
-    normalized_target = _normalize_pdf_key(pdf_id)
+    clean_filename = _clean_display_filename(pdf_id, {"filename": f"{pdf_id}.pdf"})
 
-    # Detectar aliases relacionados ANTES de actualizar
-    aliases_to_remove = []
-
-    for existing_id in list(pdf_storage.keys()):
-        if existing_id == pdf_id:
-            continue
-
-        normalized_existing = _normalize_pdf_key(existing_id)
-
-        # mismo id lógico
-        if normalized_existing == normalized_target:
-            aliases_to_remove.append(existing_id)
-            continue
-
-        # variantes derivadas:
-        # 5497_42_10_01_003_C_v2_...
-        # 5497_42_10_01_003_C_hash
-        if normalized_existing.startswith(normalized_target + "_"):
-            aliases_to_remove.append(existing_id)
-            continue
-
-    for existing_id in list(pdf_task_status.keys()):
-        if existing_id == pdf_id:
-            continue
-
-        normalized_existing = _normalize_pdf_key(existing_id)
-
-        if normalized_existing == normalized_target:
-            if existing_id not in aliases_to_remove:
-                aliases_to_remove.append(existing_id)
-            continue
-
-        if normalized_existing.startswith(normalized_target + "_"):
-            if existing_id not in aliases_to_remove:
-                aliases_to_remove.append(existing_id)
-            continue
-
-    file_size = 0
-    if os.path.exists(request.new_path):
-        try:
-            file_size = os.path.getsize(request.new_path)
-        except Exception:
-            file_size = 0
-
-    # Crear o actualizar la entrada canónica
-    pdf_storage[pdf_id] = {
-        "filename": f"{pdf_id}.pdf",
-        "pdf_path": request.new_path,
-        "size": file_size,
-        "upload_time": time.time(),
-        "mode": "local",
-        "task_id": None,
-    }
-
+    if pdf_id not in pdf_storage and pdf_id not in pdf_task_status:
+        pdf_storage[pdf_id] = {
+            "filename": clean_filename,
+            "pdf_path": request.new_path,
+            "size": 0,
+            "upload_time": time.time(),
+            "mode": "local",
+            "task_id": None,
+        }
+    else:
+        if pdf_id in pdf_storage:
+            pdf_storage[pdf_id]["pdf_path"] = request.new_path
+            pdf_storage[pdf_id]["filename"] = clean_filename
+    
     if pdf_id not in pdf_task_status:
         pdf_task_status[pdf_id] = {
             "status": "completed",
@@ -1464,22 +1439,10 @@ async def update_final_path(pdf_id: str, request: UpdatePathRequest):
             "error": None,
         }
     else:
-        pdf_task_status[pdf_id].update({
-            "status": "completed",
-            "completed_at": datetime.now(),
-            "ocr_pdf_path": request.new_path,
-            "mode": "local",
-            "error": None,
-        })
-
-    # Limpiar aliases viejos
-    for alias in aliases_to_remove:
-        pdf_storage.pop(alias, None)
-        pdf_task_status.pop(alias, None)
-
+        pdf_task_status[pdf_id]["ocr_pdf_path"] = request.new_path
+        
     return {
         "message": "Ruta actualizada exitosamente en memoria",
         "pdf_id": pdf_id,
-        "new_path": request.new_path,
-        "aliases_removed": aliases_to_remove,
+        "new_path": request.new_path
     }
